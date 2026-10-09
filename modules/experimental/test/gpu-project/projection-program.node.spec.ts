@@ -184,6 +184,36 @@ describe('projection programs', () => {
     expect(assemble('nvidia')).not.toContain(integerMarker);
   });
 
+  it('calls each heavy fp64 helper from one site in adaptive stages', () => {
+    const plan = compileProjectionPlan({
+      projection: position => [
+        2 * position[0] + 100 + position[1] ** 2 * 0.01,
+        3 * position[1] + 200
+      ],
+      bounds: [-1, -1, 1, 1],
+      degree: 2,
+      precision: 'double-single',
+      tolerance: 1e-6
+    });
+    const program: ProjectionProgram = {
+      precision: 'double-single',
+      operations: [{type: 'adaptive', plan}]
+    };
+    for (const inputFormat of ['uint32x4', 'float32x4', 'float32x2'] as const) {
+      const source = compileProjectionProgram(program, {inputFormat}).getShader().source;
+      const projectStart = source.indexOf('fn projection_projection_stage0_project(');
+      const project = source.slice(projectStart, source.indexOf('\n}', projectStart));
+      const count = (pattern: RegExp) => project.match(pattern)?.length ?? 0;
+      expect(count(/projectionPatchContains\(/g), inputFormat).toBe(1);
+      expect(count(/div_fp64\(/g), inputFormat).toBe(1);
+      expect(count(/sum_fp64\(/g), inputFormat).toBe(1);
+      expect(count(/evaluateProjectionPolynomialFP64\(/g), inputFormat).toBe(1);
+      expect(count(/sub_fp64u32_to_fp64\(|projectionDestinationOriginFP64\(/g), inputFormat).toBe(
+        1
+      );
+    }
+  });
+
   it('snapshots parameters and supports independent shader namespaces and buffer offsets', () => {
     const program: ProjectionProgram = {
       precision: 'local-f32',

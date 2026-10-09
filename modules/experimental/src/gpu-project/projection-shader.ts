@@ -283,21 +283,83 @@ fn projectionDestinationOriginFP64(patchIndex: u32, wordOffset: u32) -> vec2f {
   return sub_fp64u32_to_fp64(value, vec2u(0u));
 }`
     : '';
+  const patchSelection = routingNodeCount
+    ? `var patchIndex = assignedPatch;
+  if (patchIndex == INVALID_PATCH) { patchIndex = findProjectionPatch(position); }
+  if (patchIndex >= PATCH_COUNT || !projectionPatchContains(position, patchIndex)) {
+    return invalid;
+  }`
+    : `// One containment call site: check the assigned patch, or search every patch in order.
+  let searching = assignedPatch == INVALID_PATCH;
+  let firstCandidate = select(assignedPatch, 0u, searching);
+  let candidateCount = select(1u, PATCH_COUNT, searching);
+  var patchIndex = INVALID_PATCH;
+  for (var candidateOffset = 0u; candidateOffset < candidateCount; candidateOffset += 1u) {
+    let candidate = firstCandidate + candidateOffset;
+    if (candidate < PATCH_COUNT && projectionPatchContains(position, candidate)) {
+      patchIndex = candidate;
+      break;
+    }
+  }
+  if (patchIndex == INVALID_PATCH) {
+    return invalid;
+  }`;
+  // D3D12 inlines every call into DXIL, so each heavy fp64 helper is called from one site, in
+  // loops over the axes, rather than once per axis. The operations and their order are unchanged.
+  const doubleSingleOffsets = precise
+    ? `// Source offsets and destination origins share one raw binary64 conversion call site.
+  var rawValues = array<vec2u, 4>(
+    position.x,
+    position.y,
+    vec2u(projectionPlanWord(patchIndex, 17u), projectionPlanWord(patchIndex, 16u)),
+    vec2u(projectionPlanWord(patchIndex, 19u), projectionPlanWord(patchIndex, 18u))
+  );
+  var rawOrigins = array<vec2u, 4>(
+    vec2u(projectionPlanWord(patchIndex, 1u), projectionPlanWord(patchIndex, 0u)),
+    vec2u(projectionPlanWord(patchIndex, 3u), projectionPlanWord(patchIndex, 2u)),
+    vec2u(0u),
+    vec2u(0u)
+  );
+  var converted: array<vec2f, 4>;
+  for (var index = 0u; index < 4u; index += 1u) {
+    converted[index] = sub_fp64u32_to_fp64(rawValues[index], rawOrigins[index]);
+  }`
+    : `let sourceOffset = projectionSourceOffsetFP64(position, patchIndex);
+  var converted: array<vec2f, 4>;
+  converted[0] = sourceOffset.x;
+  converted[1] = sourceOffset.y;
+  for (var axis = 0u; axis < 2u; axis += 1u) {
+    converted[2u + axis] = projectionDestinationOriginFP64(patchIndex, 16u + 2u * axis);
+  }`;
   const writeResult = doubleSingle
-    ? `let normalizedFP64 = normalizeProjectionPositionFP64(position, patchIndex);
-  let projectedX = sum_fp64(
-    projectionDestinationOriginFP64(patchIndex, 16u),
-    evaluateProjectionPolynomialFP64(patchIndex, 20u, 40u, normalizedFP64)
+    ? `${doubleSingleOffsets}
+  var sourceScales = array<vec2f, 2>(
+    vec2f(
+      bitcast<f32>(projectionPlanWord(patchIndex, 4u)),
+      bitcast<f32>(projectionPlanWord(patchIndex, 60u))
+    ),
+    vec2f(
+      bitcast<f32>(projectionPlanWord(patchIndex, 5u)),
+      bitcast<f32>(projectionPlanWord(patchIndex, 61u))
+    )
   );
-  let projectedY = sum_fp64(
-    projectionDestinationOriginFP64(patchIndex, 18u),
-    evaluateProjectionPolynomialFP64(patchIndex, 30u, 50u, normalizedFP64)
-  );
+  var normalizedAxes: array<vec2f, 2>;
+  for (var axis = 0u; axis < 2u; axis += 1u) {
+    normalizedAxes[axis] = div_fp64(converted[axis], sourceScales[axis]);
+  }
+  let normalizedFP64 = ProjectionPointFP64(normalizedAxes[0], normalizedAxes[1]);
+  var projectedAxes: array<vec2f, 2>;
+  for (var axis = 0u; axis < 2u; axis += 1u) {
+    projectedAxes[axis] = sum_fp64(
+      converted[2u + axis],
+      evaluateProjectionPolynomialFP64(patchIndex, 20u + 10u * axis, 40u + 10u * axis, normalizedFP64)
+    );
+  }
   let projected = vec4f(
-    projectedX.x,
-    projectedX.y,
-    projectedY.x,
-    projectedY.y
+    projectedAxes[0].x,
+    projectedAxes[0].y,
+    projectedAxes[1].x,
+    projectedAxes[1].y
   );`
     : `let normalized = normalizeProjectionPosition(position, patchIndex);
   let destinationOffset = vec2f(
@@ -440,11 +502,7 @@ ${doubleSingleFunctions}
 fn project(position: ${positionType}, assignedPatch: u32) -> ProjectionResult {
   let invalid = ProjectionResult(${doubleSingle ? 'vec4f(0.0)' : 'vec2f(0.0)'}, 0u);
   if (!(${finitePosition}) || !projectionPlanContains(position)) { return invalid; }
-  var patchIndex = assignedPatch;
-  if (patchIndex == INVALID_PATCH) { patchIndex = findProjectionPatch(position); }
-  if (patchIndex >= PATCH_COUNT || !projectionPatchContains(position, patchIndex)) {
-    return invalid;
-  }
+  ${patchSelection}
   ${writeResult}
   if (!all((bitcast<${doubleSingle ? 'vec4u' : 'vec2u'}>(projected) &
     ${doubleSingle ? 'vec4u' : 'vec2u'}(0x7f800000u)) != ${doubleSingle ? 'vec4u' : 'vec2u'}(0x7f800000u))) {
