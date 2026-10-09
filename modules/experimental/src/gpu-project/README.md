@@ -228,10 +228,11 @@ const inverse = compileProjectionProgram(invertProjectionProgram(program), {
 });
 ```
 
-Axis/unit/affine/adaptive intermediates use double-single arithmetic: integer-controlled on Apple
-WebGPU, where Metal may reassociate the classic error-free transforms, and classic double-single
-elsewhere. Integer-controlled programs are much larger after inlining and can take minutes to
-compile on D3D12. Inputs
+Axis/unit/affine/adaptive intermediates use double-single arithmetic. `GPUProjectionProgram` and
+`GPUProjection` choose it per device: classic double-single on D3D12 and Vulkan, where it is
+known, and integer-controlled arithmetic on Metal, which may reassociate the classic error-free
+transforms, and whenever the backend cannot be established. Integer-controlled programs are much
+larger after inlining and can take minutes to compile on D3D12. Inputs
 can be `float32x2`, raw binary64 `uint32x4`, or absolute double-single `float32x4`. `double-single`
 output is `[xHigh, xLow, yHigh, yLow]`. For `local-f32`, the final result is translated by the
 program's binary64 `destinationOrigin` (default `[0, 0]`) before rounding to `float32x2`.
@@ -352,8 +353,7 @@ The returned shader has no entry point, dispatch, or output buffer. It can be ca
 a render or analysis shader. Each use can select a namespace and a parameter word offset for
 embedding in a larger buffer. Preserve declaration order when assigning `@binding(auto)` locations:
 the generated parameter binding appears where `shader.source` is inserted. Pass the returned
-modules and defines: they select the platform's fp64 implementation and carry the uniforms that
-classic double-single arithmetic needs.
+modules and defines to enable the integer-controlled fp64 implementation, which needs no uniforms.
 
 Pass upstream row validity to the callable, or use the contributor's `inputValidity` column.
 Zero validity short-circuits evaluation and produces zero output with zero validity. Valid zero

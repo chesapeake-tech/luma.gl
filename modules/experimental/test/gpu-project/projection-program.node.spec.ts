@@ -10,6 +10,7 @@ import {WGSLShaderAssembler, type PlatformInfo} from '@luma.gl/shadertools';
 import {
   compileProjectionPlan,
   compileProjectionProgram,
+  indexProjectionPlan,
   evaluateProjectionProgram,
   invertProjectionProgram,
   GPUProjectionProgram,
@@ -155,13 +156,12 @@ describe('projection programs', () => {
     ).toBe(false);
   });
 
-  it('selects fp64 arithmetic by platform and carries the classic-path uniforms', () => {
+  it('keeps integer-controlled arithmetic for inline consumers of getShader()', () => {
     const shader = compileProjectionProgram(nativeProgram).getShader();
-    expect(shader.defines).not.toHaveProperty('LUMA_FP64_INTEGER_ARITHMETIC');
+    expect(shader.defines).toEqual({LUMA_FP64_INTEGER_ARITHMETIC: true});
     expect(shader.modules.map(module => module.name)).toEqual(['fp64arithmetic']);
-    expect(shader.modules[0].uniformTypes).toEqual({ONE: 'f32', SPLIT: 'f32'});
-    expect(shader.modules[0].defaultUniforms).toEqual({ONE: 1, SPLIT: 4097});
-
+    // Inline consumers need no fp64 uniforms.
+    expect(shader.modules[0].uniformTypes).toBeUndefined();
     const platformInfo: PlatformInfo = {
       type: 'webgpu',
       gpu: 'nvidia',
@@ -169,19 +169,13 @@ describe('projection programs', () => {
       shaderLanguageVersion: 300,
       features: new Set()
     };
-    const assemble = (gpu: string) =>
-      new WGSLShaderAssembler().assembleWGSLShader({
-        platformInfo: {...platformInfo, gpu},
-        source: shader.source,
-        modules: shader.modules,
-        defines: shader.defines
-      }).source;
-    const integerMarker = 'fn fp64_accumulate_f32_integer';
-    const classicMarker = 'let splitValue = prevent_fp64_optimization';
-    expect(assemble('apple')).toContain(integerMarker);
-    expect(assemble('apple')).not.toContain(classicMarker);
-    expect(assemble('nvidia')).toContain(classicMarker);
-    expect(assemble('nvidia')).not.toContain(integerMarker);
+    const assembled = new WGSLShaderAssembler().assembleWGSLShader({
+      platformInfo,
+      source: shader.source,
+      modules: shader.modules,
+      defines: shader.defines
+    }).source;
+    expect(assembled).toContain('fn fp64_accumulate_f32_integer');
   });
 
   it('calls each heavy fp64 helper from one site in adaptive stages', () => {
@@ -195,22 +189,49 @@ describe('projection programs', () => {
       precision: 'double-single',
       tolerance: 1e-6
     });
-    const program: ProjectionProgram = {
-      precision: 'double-single',
-      operations: [{type: 'adaptive', plan}]
-    };
-    for (const inputFormat of ['uint32x4', 'float32x4', 'float32x2'] as const) {
-      const source = compileProjectionProgram(program, {inputFormat}).getShader().source;
-      const projectStart = source.indexOf('fn projection_projection_stage0_project(');
-      const project = source.slice(projectStart, source.indexOf('\n}', projectStart));
-      const count = (pattern: RegExp) => project.match(pattern)?.length ?? 0;
-      expect(count(/projectionPatchContains\(/g), inputFormat).toBe(1);
-      expect(count(/div_fp64\(/g), inputFormat).toBe(1);
-      expect(count(/sum_fp64\(/g), inputFormat).toBe(1);
-      expect(count(/evaluateProjectionPolynomialFP64\(/g), inputFormat).toBe(1);
-      expect(count(/sub_fp64u32_to_fp64\(|projectionDestinationOriginFP64\(/g), inputFormat).toBe(
-        1
-      );
+    const routedPlan = indexProjectionPlan(
+      compileProjectionPlan({
+        projection: position => [Math.sin(position[0]), Math.cos(position[1])],
+        bounds: [-2, -2, 2, 2],
+        precision: 'double-single',
+        degree: 2,
+        tolerance: 0.001
+      })
+    );
+    expect(routedPlan.routingIndex!.length).toBeGreaterThan(1);
+    for (const [label, stagePlan] of [
+      ['scan', plan],
+      ['routed', routedPlan]
+    ] as const) {
+      const program: ProjectionProgram = {
+        precision: 'double-single',
+        operations: [{type: 'adaptive', plan: stagePlan}]
+      };
+      for (const inputFormat of ['uint32x4', 'float32x4', 'float32x2'] as const) {
+        const name = `${label}/${inputFormat}`;
+        const source = compileProjectionProgram(program, {inputFormat}).getShader().source;
+        // Count call sites across the whole stage, excluding the function definitions.
+        const count = (callee: string) =>
+          (source.match(new RegExp(`\\b${callee}\\(`, 'g'))?.length ?? 0) -
+          (source.match(new RegExp(`\\bfn ${callee}\\(`, 'g'))?.length ?? 0);
+        expect(count('projection_projection_stage0_projectionPatchContains'), name).toBe(1);
+        const projectStart = source.indexOf('fn projection_projection_stage0_project(');
+        const project = source.slice(projectStart, source.indexOf('\n}', projectStart));
+        const countInProject = (pattern: RegExp) => project.match(pattern)?.length ?? 0;
+        expect(countInProject(/div_fp64\(/g), name).toBe(1);
+        expect(countInProject(/sum_fp64\(/g), name).toBe(1);
+        expect(countInProject(/evaluateProjectionPolynomialFP64\(/g), name).toBe(1);
+        expect(
+          countInProject(/sub_fp64u32_to_fp64\(|projectionDestinationOriginFP64\(/g),
+          name
+        ).toBe(1);
+        // Helpers that project() no longer calls are not emitted.
+        expect(source, name).not.toContain('normalizeProjectionPositionFP64');
+        if (inputFormat === 'uint32x4') {
+          expect(source, name).not.toContain('projectionSourceOffsetFP64');
+          expect(source, name).not.toContain('projectionDestinationOriginFP64');
+        }
+      }
     }
   });
 

@@ -11,8 +11,11 @@ import {
   GraphVectorView,
   type GraphImportedBuffer
 } from '@luma.gl/gpgpu/gpu-core';
+import type {Device} from '@luma.gl/core';
 import {
-  isWGSLIdentifierReachable,
+  addFP64UniformUse,
+  getClassicFP64Defines,
+  getPlatformFP64Arithmetic,
   validateDisjointGeospatialViews
 } from '../../src/geospatial/geospatial-utils';
 
@@ -180,25 +183,122 @@ function makeDynamicBuffer(buffer: Buffer): DynamicBuffer {
   return dynamicBuffer;
 }
 
-describe('isWGSLIdentifierReachable', () => {
-  const source = /* wgsl */ `
-@group(0) @binding(100) var<uniform> fp64arithmetic: Fp64ArithmeticUniforms;
-fn split(a: f32) -> vec2f { return vec2f(a * fp64arithmetic.SPLIT, 0.0); }
-fn mul(a: f32) -> vec2f { return split(a); }
-fn add(a: f32) -> f32 { return a + 1.0; }
-@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
-  let value = ENTRY_CALL;
-}`;
+describe('getPlatformFP64Arithmetic', () => {
+  const device = (info: Partial<Device['info']>) =>
+    ({
+      info: {type: 'webgpu', gpu: 'nvidia', gpuType: 'discrete', gpuBackend: 'unknown', ...info}
+    }) as unknown as Device;
+  const withNavigator = (navigator: unknown, run: () => void) => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {value: navigator, configurable: true});
+    try {
+      run();
+    } finally {
+      if (descriptor) Object.defineProperty(globalThis, 'navigator', descriptor);
+      else delete (globalThis as {navigator?: unknown}).navigator;
+    }
+  };
 
-  it('follows calls from the compute entry point', () => {
-    expect(
-      isWGSLIdentifierReachable(source.replace('ENTRY_CALL', 'mul(1.0).x'), 'fp64arithmetic.')
-    ).toBe(true);
+  const macintosh = {platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X)'};
+  const windows = {platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'};
+
+  it('uses classic double-single on known D3D12 and Vulkan backends', () => {
+    // A reported backend takes precedence over the host operating system.
+    withNavigator(macintosh, () => {
+      for (const gpuBackend of ['d3d12', 'd3d11', 'vulkan'] as const) {
+        expect(getPlatformFP64Arithmetic(device({gpuBackend})), gpuBackend).toBe('classic');
+      }
+    });
   });
 
-  it('ignores functions the entry point never calls', () => {
-    expect(
-      isWGSLIdentifierReachable(source.replace('ENTRY_CALL', 'add(1.0)'), 'fp64arithmetic.')
-    ).toBe(false);
+  it('keeps integer arithmetic on Metal whatever the vendor', () => {
+    withNavigator(windows, () => {
+      for (const gpu of ['apple', 'intel', 'amd', 'nvidia', 'unknown'] as const) {
+        expect(getPlatformFP64Arithmetic(device({gpu, gpuBackend: 'metal'})), gpu).toBe('integer');
+      }
+    });
+  });
+
+  it('keeps integer arithmetic for Apple GPUs, software adapters and WebGL', () => {
+    withNavigator(windows, () => {
+      expect(getPlatformFP64Arithmetic(device({gpu: 'apple', gpuBackend: 'unknown'}))).toBe(
+        'integer'
+      );
+      expect(getPlatformFP64Arithmetic(device({gpu: 'software'}))).toBe('integer');
+      expect(getPlatformFP64Arithmetic(device({gpuType: 'cpu'}))).toBe('integer');
+      expect(getPlatformFP64Arithmetic(device({fallback: true}))).toBe('integer');
+      expect(getPlatformFP64Arithmetic(device({type: 'webgl', gpuBackend: 'd3d11'}))).toBe(
+        'integer'
+      );
+    });
+  });
+
+  it('decides an unreported backend from the host operating system', () => {
+    const linux = {platform: 'Linux x86_64', userAgent: 'Mozilla/5.0 (X11; Linux x86_64)'};
+    withNavigator(macintosh, () => {
+      for (const gpu of ['intel', 'amd', 'unknown'] as const) {
+        expect(getPlatformFP64Arithmetic(device({gpu})), gpu).toBe('integer');
+      }
+    });
+    withNavigator(windows, () => expect(getPlatformFP64Arithmetic(device({}))).toBe('classic'));
+    withNavigator(linux, () => expect(getPlatformFP64Arithmetic(device({}))).toBe('classic'));
+    withNavigator({platform: '', userAgent: ''}, () =>
+      expect(getPlatformFP64Arithmetic(device({}))).toBe('integer')
+    );
+    withNavigator(undefined, () => expect(getPlatformFP64Arithmetic(device({}))).toBe('integer'));
+  });
+});
+
+describe('getClassicFP64Defines', () => {
+  it('applies the per-vendor fp64 workarounds of the GLSL platform defines', () => {
+    expect(getClassicFP64Defines('nvidia')).toEqual({
+      LUMA_FP64_INTEGER_ARITHMETIC: false,
+      LUMA_FP64_CODE_ELIMINATION_WORKAROUND: true
+    });
+    expect(getClassicFP64Defines('amd')).toEqual({LUMA_FP64_INTEGER_ARITHMETIC: false});
+    for (const gpu of ['intel', 'unknown']) {
+      expect(getClassicFP64Defines(gpu), gpu).toEqual({
+        LUMA_FP64_INTEGER_ARITHMETIC: false,
+        LUMA_FP64_CODE_ELIMINATION_WORKAROUND: true,
+        LUMA_FP64_HIGH_BITS_OVERFLOW_WORKAROUND: true
+      });
+    }
+  });
+});
+
+describe('addFP64UniformUse', () => {
+  const use = '_ = fp64arithmetic.ONE;';
+
+  it('adds a static use at the start of the compute entry point body', () => {
+    const source = `fn helper(a: f32) -> f32 { return a; }
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) workgroupId: vec3u, @builtin(local_invocation_id) localId: vec3u) {
+  let x = helper(1.0);
+}`;
+    const result = addFP64UniformUse(source);
+    expect(result.indexOf(use)).toBeGreaterThan(result.indexOf('localId: vec3u) {'));
+    expect(result.indexOf(use)).toBeLessThan(result.indexOf('let x = helper'));
+    expect(result.replace(`\n  ${use}`, '')).toBe(source);
+  });
+
+  it('ignores entry points and braces inside comments', () => {
+    const source = `// @compute @workgroup_size(1) fn commented() { }
+/* @compute fn alsoCommented() { } */
+@compute @workgroup_size(1) fn main(/* { */ @builtin(global_invocation_id) id: vec3u) {
+  // }
+  let x = 1u;
+}`;
+    const result = addFP64UniformUse(source);
+    const bodyStart = source.indexOf('vec3u) {') + 'vec3u) {'.length;
+    expect(result.slice(bodyStart).trimStart().startsWith(use)).toBe(true);
+  });
+
+  it('rejects sources without exactly one compute entry point', () => {
+    expect(() => addFP64UniformUse('fn helper() {}')).toThrow('expected one compute entry point');
+    expect(() =>
+      addFP64UniformUse(
+        '@compute @workgroup_size(1) fn a() {}\n@compute @workgroup_size(1) fn b() {}'
+      )
+    ).toThrow('expected one compute entry point');
   });
 });

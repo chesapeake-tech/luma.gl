@@ -3,9 +3,14 @@
 // SPDX-FileCopyrightText: Copyright (c) vis.gl contributors
 // SPDX-FileComment: Independently implemented for WebGPU; inspired by NVIDIA RAPIDS cuSpatial.
 
-import {type Binding, type Buffer, type Device, type DeviceFeature} from '@luma.gl/core';
-import {Computation, DynamicBuffer} from '@luma.gl/engine';
-import {fp64arithmetic, WGSLShaderAssembler, type ShaderModule} from '@luma.gl/shadertools';
+import {type Binding, type Buffer, type Device} from '@luma.gl/core';
+import {Computation, DynamicBuffer, getPlatformInfo} from '@luma.gl/engine';
+import {
+  fp64arithmetic,
+  ShaderAssembler,
+  type ShaderModule,
+  type WGSLShaderAssembler
+} from '@luma.gl/shadertools';
 import type {GPUVectorFormat} from '@luma.gl/gpgpu/gpu-data';
 import {
   GPUCommandGraph,
@@ -35,14 +40,75 @@ export const GEOSPATIAL_INTEGER_FP64_ARITHMETIC_MODULE: ShaderModule = {
 };
 
 /**
- * fp64 arithmetic selection for precise geospatial kernels. @internal
+ * fp64 arithmetic requested for a precise geospatial kernel. @internal
  * - `integer`: always use the integer-controlled implementation.
- * - `platform`: use the platform default, which `ShaderAssembler` sets to integer-controlled
- *   arithmetic only on Apple WebGPU and to classic double-single elsewhere. Classic
- *   double-single needs the `fp64arithmetic` uniforms, so the full module is used and its
- *   uniforms are uploaded.
+ * - `classic`: always use classic double-single, with the fp64arithmetic uniforms bound.
+ * - `platform`: choose per device with `getPlatformFP64Arithmetic()`.
  */
-export type GeospatialFP64Arithmetic = 'integer' | 'platform';
+export type GeospatialFP64Arithmetic = 'integer' | 'classic' | 'platform';
+
+/**
+ * Chooses fp64 arithmetic for precise kernels on a device. @internal
+ *
+ * Metal reassociates the floating-point transforms classic double-single arithmetic relies on,
+ * so Metal keeps the integer-controlled implementation. D3D12 inlines every function call into
+ * DXIL, where the integer-controlled shaders grow too large to compile in practical time, so
+ * D3D12 and Vulkan use classic double-single. Whenever the backend cannot be established, the
+ * integer-controlled implementation is kept: it is correct everywhere, only slow to compile.
+ */
+export function getPlatformFP64Arithmetic(device: Device): 'integer' | 'classic' {
+  const {type, gpu, gpuType, gpuBackend, fallback} = device.info;
+  if (type !== 'webgpu' || gpu === 'apple' || gpu === 'software' || gpuType === 'cpu' || fallback) {
+    return 'integer';
+  }
+  if (gpuBackend === 'metal') {
+    return 'integer';
+  }
+  if (gpuBackend === 'd3d12' || gpuBackend === 'd3d11' || gpuBackend === 'vulkan') {
+    return 'classic';
+  }
+  // Browsers rarely report the backend; WebGPU uses Metal on every Apple operating system.
+  return getHostOperatingSystem() === 'non-apple' ? 'classic' : 'integer';
+}
+
+/** Classifies the host operating system from the navigator, or `unknown` without one. */
+function getHostOperatingSystem(): 'apple' | 'non-apple' | 'unknown' {
+  const navigator = (
+    globalThis as {
+      navigator?: {userAgentData?: {platform?: string}; platform?: string; userAgent?: string};
+    }
+  ).navigator;
+  const platform = `${navigator?.userAgentData?.platform ?? ''} ${navigator?.platform ?? ''} ${
+    navigator?.userAgent ?? ''
+  }`;
+  if (/mac|darwin|iphone|ipad|ipod|\bios\b/i.test(platform)) {
+    return 'apple';
+  }
+  if (/win|linux|android|cros|x11/i.test(platform)) {
+    return 'non-apple';
+  }
+  return 'unknown';
+}
+
+/**
+ * Defines for classic double-single arithmetic. WGSL assembly does not emit the GLSL platform
+ * defines, so the same per-vendor fp64 workarounds are applied here. @internal
+ */
+export function getClassicFP64Defines(gpu: string): Record<string, boolean> {
+  switch (gpu.toLowerCase()) {
+    case 'nvidia':
+      return {LUMA_FP64_INTEGER_ARITHMETIC: false, LUMA_FP64_CODE_ELIMINATION_WORKAROUND: true};
+    case 'amd':
+      return {LUMA_FP64_INTEGER_ARITHMETIC: false};
+    default:
+      // Intel and unidentified GPUs get both workarounds, as in the GLSL platform defines.
+      return {
+        LUMA_FP64_INTEGER_ARITHMETIC: false,
+        LUMA_FP64_CODE_ELIMINATION_WORKAROUND: true,
+        LUMA_FP64_HIGH_BITS_OVERFLOW_WORKAROUND: true
+      };
+  }
+}
 
 export type GPURowView<T extends GPUVectorFormat> = GraphDataView<T> | GraphVectorView<T>;
 
@@ -345,27 +411,33 @@ export function addGeospatialPass<Parameters>(
     id: props.id,
     resources: props.resources,
     compile: ({device}) => {
-      const platformArithmetic = props.fp64Arithmetic === 'platform';
+      const classic =
+        props.precise &&
+        (props.fp64Arithmetic === 'classic' ||
+          (props.fp64Arithmetic === 'platform' && getPlatformFP64Arithmetic(device) === 'classic'));
       const modules: ShaderModule[] = props.precise
-        ? [
-            platformArithmetic
-              ? (fp64arithmetic as ShaderModule)
-              : GEOSPATIAL_INTEGER_FP64_ARITHMETIC_MODULE
-          ]
+        ? [classic ? (fp64arithmetic as ShaderModule) : GEOSPATIAL_INTEGER_FP64_ARITHMETIC_MODULE]
         : [];
       const fp64Profile = props.fp64Profile ?? 'full';
       const defines: Record<string, boolean | number> = props.precise
         ? {
-            ...(platformArithmetic ? {} : {LUMA_FP64_INTEGER_ARITHMETIC: true}),
+            ...(classic
+              ? getClassicFP64Defines(device.info.gpu)
+              : {LUMA_FP64_INTEGER_ARITHMETIC: true}),
             ...(fp64Profile === 'full' ? {} : {LUMA_FP64_PREDICATE_ONLY: true}),
             ...(fp64Profile === 'predicate-f32' ? {LUMA_FP64_F32_INPUT_ONLY: true} : {})
           }
         : {};
+      // Classic arithmetic reads the fp64arithmetic uniforms. The entry point uses them
+      // statically, so the automatic pipeline layout always includes the uniform binding.
+      const source = classic ? addFP64UniformUse(props.source) : props.source;
+      const shaderAssembler = ShaderAssembler.getDefaultShaderAssembler('wgsl');
       const computation = new Computation(device, {
         id: props.id,
-        source: props.source,
+        source,
         modules,
         defines,
+        shaderAssembler,
         shaderLayout: {
           bindings: [
             ...Object.keys(props.bindings).map((name, location) => ({
@@ -374,13 +446,13 @@ export function addGeospatialPass<Parameters>(
               group: 0,
               location
             })),
-            ...(props.precise && platformArithmetic
-              ? getFP64UniformBindings(device, props.source, modules, defines)
+            ...(classic
+              ? [getFP64UniformBinding(device, shaderAssembler, source, modules, defines)]
               : [])
           ]
         }
       });
-      if (props.precise && platformArithmetic) {
+      if (classic) {
         // The pass dispatches without predraw(), so upload the constant fp64 uniforms once.
         computation.updateShaderInputs();
       }
@@ -405,69 +477,66 @@ export function addGeospatialPass<Parameters>(
 }
 
 /**
- * Returns the fp64arithmetic uniform binding when the assembled kernel statically uses it.
- * Compute pipelines use an automatic layout, which omits bindings the entry point never reaches,
- * so the uniform block may only be bound when classic double-single arithmetic actually reads it.
+ * Returns the fp64arithmetic uniform binding of a kernel, as the assembler the Computation uses
+ * assigns it. The binding location comes from that assembler's registry, so it matches.
  */
-function getFP64UniformBindings(
+function getFP64UniformBinding(
   device: Device,
+  shaderAssembler: WGSLShaderAssembler,
   source: string,
   modules: ShaderModule[],
   defines: Record<string, boolean | number>
-): {name: string; type: 'uniform'; group: number; location: number}[] {
-  const assembled = new WGSLShaderAssembler().assembleWGSLShader({
-    platformInfo: {
-      type: device.type,
-      shaderLanguage: device.info.shadingLanguage,
-      shaderLanguageVersion: device.info.shadingLanguageVersion as 100 | 300,
-      gpu: device.info.gpu,
-      limits: device.limits as unknown as Record<string, number | undefined>,
-      features: device.features as unknown as Set<DeviceFeature>
-    },
+): {name: string; type: 'uniform'; group: number; location: number} {
+  const assembled = shaderAssembler.assembleWGSLShader({
+    platformInfo: getPlatformInfo(device),
     source,
     modules,
     defines,
     shaderStage: 'compute',
     scanVertexAttributes: false
-  });
-  const binding = assembled.shaderLayout?.bindings.find(
-    candidate => candidate.name === fp64arithmetic.name
-  );
-  if (!binding || !isWGSLIdentifierReachable(assembled.source, `${fp64arithmetic.name}.`)) {
-    return [];
+  }).source;
+  const match = new RegExp(
+    `@group\\((\\d+)\\)\\s*@binding\\((\\d+)\\)\\s*var<uniform>\\s*${fp64arithmetic.name}\\b`
+  ).exec(assembled);
+  if (!match) {
+    throw new Error('classic fp64 arithmetic requires the fp64arithmetic uniform binding');
   }
-  return [{name: binding.name, type: 'uniform', group: binding.group, location: binding.location}];
+  return {
+    name: fp64arithmetic.name,
+    type: 'uniform',
+    group: Number(match[1]),
+    location: Number(match[2])
+  };
 }
 
-/** Tests whether text occurs in the compute entry point or in a function it calls. @internal */
-export function isWGSLIdentifierReachable(source: string, text: string): boolean {
-  const functions = new Map<string, string>();
-  let entryPoint: string | undefined;
-  const functionPattern = /(@compute[^;{]*?)?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-  for (let match = functionPattern.exec(source); match; match = functionPattern.exec(source)) {
-    const bodyStart = source.indexOf('{', functionPattern.lastIndex);
-    let depth = 0;
-    let bodyEnd = bodyStart;
-    for (; bodyEnd < source.length; bodyEnd++) {
-      if (source[bodyEnd] === '{') depth++;
-      else if (source[bodyEnd] === '}' && --depth === 0) break;
-    }
-    functions.set(match[2], source.slice(bodyStart, bodyEnd + 1));
-    if (match[1]) entryPoint = match[2];
+/**
+ * Adds a static use of the fp64arithmetic uniforms at the start of the compute entry point, so
+ * the uniform binding is part of the automatic pipeline layout whatever the kernel computes.
+ * @internal
+ */
+export function addFP64UniformUse(source: string): string {
+  // Search a copy with comments blanked out, so positions still match the original source.
+  const searchable = source.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, comment =>
+    comment.replace(/[^\n]/g, ' ')
+  );
+  const entryPoints = [
+    ...searchable.matchAll(/@compute\b[^;{]*?\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/g)
+  ];
+  if (entryPoints.length !== 1) {
+    throw new Error(`expected one compute entry point, found ${entryPoints.length}`);
   }
-  const pending = entryPoint ? [entryPoint] : [...functions.keys()];
-  const visited = new Set<string>();
-  while (pending.length) {
-    const name = pending.pop()!;
-    if (visited.has(name)) continue;
-    visited.add(name);
-    const body = functions.get(name) ?? '';
-    if (body.includes(text)) return true;
-    for (const call of body.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
-      if (functions.has(call[1])) pending.push(call[1]);
-    }
+  // Skip the parameter list, whose attributes contain parentheses, then the return type.
+  let index = entryPoints[0].index! + entryPoints[0][0].length;
+  for (let depth = 1; depth > 0 && index < searchable.length; index++) {
+    if (searchable[index] === '(') depth++;
+    else if (searchable[index] === ')') depth--;
   }
-  return false;
+  const bodyStart = searchable.indexOf('{', index);
+  if (bodyStart < 0) {
+    throw new Error('compute entry point has no body');
+  }
+  return `${source.slice(0, bodyStart + 1)}
+  _ = ${fp64arithmetic.name}.ONE;${source.slice(bodyStart + 1)}`;
 }
 
 /** Formats a finite f32 value as valid WGSL without malformed exponent suffixes. */

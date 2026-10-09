@@ -19,7 +19,11 @@ import {
   type ProjectionProgram,
   type ProjectionInputFormat
 } from '@luma.gl/experimental/gpu-project';
-import {addGeospatialPass} from '../../src/geospatial/geospatial-utils';
+import {
+  addFP64UniformUse,
+  addGeospatialPass,
+  getPlatformFP64Arithmetic
+} from '../../src/geospatial/geospatial-utils';
 import {
   geographicCRS,
   makeTransverseMercatorCRS,
@@ -413,8 +417,11 @@ it('embeds two namespaced programs directly in a consumer computation', async co
   const inverse = compileProjectionProgram(invertProjectionProgram(definition), {
     inputFormat: 'float32x4'
   });
-  const forwardShader = forward.getShader({namespace: 'forward'});
-  const inverseShader = inverse.getShader({namespace: 'inverse'});
+  // Integer-controlled shaders are slow to compile on D3D12, so consumers there opt into classic
+  // double-single arithmetic, which needs the fp64arithmetic uniforms bound and uploaded.
+  const fp64Arithmetic = getPlatformFP64Arithmetic(device);
+  const forwardShader = forward.getShader({namespace: 'forward', fp64Arithmetic});
+  const inverseShader = inverse.getShader({namespace: 'inverse', fp64Arithmetic});
   const forwardBuffer = device.createBuffer({
     data: forward.packParameters(),
     usage: Buffer.STORAGE
@@ -424,22 +431,28 @@ it('embeds two namespaced programs directly in a consumer computation', async co
     usage: Buffer.STORAGE
   });
   const output = device.createBuffer({byteLength: 16, usage: Buffer.STORAGE | Buffer.COPY_SRC});
-  const computation = new Computation(device, {
-    source: `${forwardShader.source}\n${inverseShader.source}
+  const source = `${forwardShader.source}\n${inverseShader.source}
 @group(0) @binding(auto) var<storage, read_write> output: array<vec4f>;
 @compute @workgroup_size(1) fn main() {
   let projected = ${forwardShader.entryPoint}(vec2f(0.015625, -0.03125), 1u);
   let restored = ${inverseShader.entryPoint}(projected.position, projected.valid);
   output[0] = restored.position;
-}`,
+}`;
+  const computation = new Computation(device, {
+    // A classic consumer statically uses the uniforms, so the inferred layout includes them.
+    source: fp64Arithmetic === 'classic' ? addFP64UniformUse(source) : source,
     modules: forwardShader.modules,
     defines: forwardShader.defines,
-    shaderLayout: {
-      bindings: [forwardShader.bindingName, inverseShader.bindingName, 'output'].map(
-        (name, location) => ({name, location, group: 0, type: 'storage' as const})
-      )
-    }
+    shaderLayout:
+      fp64Arithmetic === 'classic'
+        ? undefined
+        : {
+            bindings: [forwardShader.bindingName, inverseShader.bindingName, 'output'].map(
+              (name, location) => ({name, location, group: 0, type: 'storage' as const})
+            )
+          }
   });
+  computation.updateShaderInputs();
   computation.setBindings({
     [forwardShader.bindingName]: forwardBuffer,
     [inverseShader.bindingName]: inverseBuffer,
@@ -954,48 +967,62 @@ it('reuses native forward/inverse GPU programs across all UTM zones and hemisphe
   }
 }, 60000);
 
-it('uploads the classic fp64 uniforms used by platform-selected arithmetic', async context => {
+it('runs classic double-single arithmetic within double-single error of the CPU reference', async context => {
   const device = await getWebGPUTestDevice();
   if (!device) {
     return;
   }
   skipSoftwareDevice(device, context);
+  // Metal may reassociate the classic error-free transforms; it keeps integer arithmetic.
+  if (getPlatformFP64Arithmetic(device) !== 'classic') {
+    context.skip();
+  }
+  // Inexact scales and large offsets make the result depend on the low limbs, so missing or
+  // zero fp64arithmetic uniforms (SPLIT = 0 disables splitting) show up as float32-sized errors.
+  const program: ProjectionProgram = {
+    precision: 'double-single',
+    operations: [
+      {type: 'affine', scale: [1 / 3, 7 / 9], offset: [123456.789, -98765.4321]},
+      {type: 'unit', factor: 0.3048}
+    ]
+  };
+  const coordinates = [
+    [1234.5678, -4321.875],
+    [-0.000123, 98765.4321],
+    [33333.333, 0.1]
+  ].map(point => point.map(Math.fround));
   const graph = new GPUCommandGraph(device);
-  const inputBuffer = device.createBuffer({byteLength: 16, usage: Buffer.STORAGE});
-  const outputBuffer = device.createBuffer({byteLength: 32, usage: Buffer.STORAGE});
-  const positions = graph.createDataView(
-    graph.importBuffer(
-      {id: 'uniform-input', byteLength: inputBuffer.byteLength, usage: inputBuffer.usage},
-      inputBuffer
-    ),
-    {format: 'float32x2', length: 2}
-  );
-  const output = graph.createDataView(
-    graph.importBuffer(
-      {id: 'uniform-output', byteLength: outputBuffer.byteLength, usage: outputBuffer.usage},
-      outputBuffer
-    ),
-    {format: 'float32x4', length: 2}
-  );
-  const update = vi.spyOn(Computation.prototype, 'updateShaderInputs');
+  const inputBuffer = device.createBuffer({
+    data: new Float32Array(coordinates.flat()),
+    usage: Buffer.STORAGE
+  });
+  const outputBuffer = device.createBuffer({
+    byteLength: coordinates.length * 16,
+    usage: Buffer.STORAGE | Buffer.COPY_SRC
+  });
   const contributor = new GPUProjectionProgram({
-    projection: compileProjectionProgram({
-      precision: 'double-single',
-      operations: [{type: 'unit', factor: 2}]
-    }),
-    positions,
-    output
+    projection: compileProjectionProgram(program, {inputFormat: 'float32x2'}),
+    positions: importView(graph, 'classic-input', inputBuffer, 'float32x2', coordinates.length),
+    output: importView(graph, 'classic-output', outputBuffer, 'float32x4', coordinates.length)
   });
   contributor.addToGraph(graph);
   const compiled = await graph.compileAsync();
   try {
-    expect(update).toHaveBeenCalled();
-    const computation = update.mock.contexts[0] as Computation;
-    expect(computation.shaderInputs.getUniformValues()).toMatchObject({
-      fp64arithmetic: {ONE: 1, SPLIT: 4097}
-    });
+    execute(device, compiled);
+    const output = new Float32Array((await outputBuffer.readAsync()).buffer);
+    for (let row = 0; row < coordinates.length; row++) {
+      const expected = evaluateProjectionProgram(program, [
+        coordinates[row][0],
+        coordinates[row][1]
+      ]);
+      expect(expected.valid).toBe(true);
+      const x = output[row * 4] + output[row * 4 + 1];
+      const y = output[row * 4 + 2] + output[row * 4 + 3];
+      // Float32 rounding of these magnitudes is about 1e-3; double-single is far below 1e-6.
+      expect(Math.abs(x - expected.position[0]), `x ${row}`).toBeLessThan(1e-6);
+      expect(Math.abs(y - expected.position[1]), `y ${row}`).toBeLessThan(1e-6);
+    }
   } finally {
-    vi.restoreAllMocks();
     compiled.destroy();
     contributor.destroy();
     inputBuffer.destroy();
