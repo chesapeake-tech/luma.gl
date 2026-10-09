@@ -3,8 +3,7 @@
 // SPDX-FileCopyrightText: Copyright (c) vis.gl contributors
 // SPDX-FileComment: Independently implemented for WebGPU; inspired by NVIDIA RAPIDS cuProj.
 
-import type {ShaderModule} from '@luma.gl/shadertools';
-import {GEOSPATIAL_INTEGER_FP64_ARITHMETIC_MODULE} from '../geospatial/geospatial-utils';
+import {fp64arithmetic, type ShaderModule} from '@luma.gl/shadertools';
 import {evaluateProjectionPlan, findProjectionPatch, packProjectionPlan} from './projection-plan';
 import {getProjectionShaderFunctions} from './projection-shader';
 import {getProjectionProgramMetadata, type ProjectionProgramMetadata} from './projection-metadata';
@@ -115,8 +114,10 @@ export class CompiledProjection {
       source: this.shaderSource.replace(/PROGRAM|PARAMETER_OFFSET/g, token =>
         token === 'PROGRAM' ? prefix : `${parameterOffset}u`
       ),
-      modules: [GEOSPATIAL_INTEGER_FP64_ARITHMETIC_MODULE],
-      defines: {LUMA_FP64_INTEGER_ARITHMETIC: true},
+      // Platform-selected fp64 arithmetic: integer-controlled on Apple WebGPU, classic
+      // double-single elsewhere. The full module carries the uniforms classic arithmetic needs.
+      modules: [fp64arithmetic as ShaderModule],
+      defines: {},
       entryPoint: `${prefix}_project`,
       bindingName: `${prefix}_parameters`,
       inputType:

@@ -123,6 +123,7 @@ for (const inputFormat of formats) {
       addGeospatialPass(graph, {
         id: 'inline-consumer',
         precise: true,
+        fp64Arithmetic: 'platform',
         dispatchLayout: {x: 1, y: 1, z: 1},
         bindings: {
           [shader.bindingName]: parameters,
@@ -786,6 +787,7 @@ for (const {inputFormat, family} of formats.flatMap(inputFormat =>
       addGeospatialPass(graph, {
         id: 'inline-analytic',
         precise: true,
+        fp64Arithmetic: 'platform',
         dispatchLayout: {x: points.length, y: 1, z: 1},
         bindings: {
           [shader.bindingName]: parameters,
@@ -951,6 +953,55 @@ it('reuses native forward/inverse GPU programs across all UTM zones and hemisphe
     for (const buffer of [...inputs, ...outputs, ...validities]) buffer.destroy();
   }
 }, 60000);
+
+it('uploads the classic fp64 uniforms used by platform-selected arithmetic', async context => {
+  const device = await getWebGPUTestDevice();
+  if (!device) {
+    return;
+  }
+  skipSoftwareDevice(device, context);
+  const graph = new GPUCommandGraph(device);
+  const inputBuffer = device.createBuffer({byteLength: 16, usage: Buffer.STORAGE});
+  const outputBuffer = device.createBuffer({byteLength: 32, usage: Buffer.STORAGE});
+  const positions = graph.createDataView(
+    graph.importBuffer(
+      {id: 'uniform-input', byteLength: inputBuffer.byteLength, usage: inputBuffer.usage},
+      inputBuffer
+    ),
+    {format: 'float32x2', length: 2}
+  );
+  const output = graph.createDataView(
+    graph.importBuffer(
+      {id: 'uniform-output', byteLength: outputBuffer.byteLength, usage: outputBuffer.usage},
+      outputBuffer
+    ),
+    {format: 'float32x4', length: 2}
+  );
+  const update = vi.spyOn(Computation.prototype, 'updateShaderInputs');
+  const contributor = new GPUProjectionProgram({
+    projection: compileProjectionProgram({
+      precision: 'double-single',
+      operations: [{type: 'unit', factor: 2}]
+    }),
+    positions,
+    output
+  });
+  contributor.addToGraph(graph);
+  const compiled = await graph.compileAsync();
+  try {
+    expect(update).toHaveBeenCalled();
+    const computation = update.mock.contexts[0] as Computation;
+    expect(computation.shaderInputs.getUniformValues()).toMatchObject({
+      fp64arithmetic: {ONE: 1, SPLIT: 4097}
+    });
+  } finally {
+    vi.restoreAllMocks();
+    compiled.destroy();
+    contributor.destroy();
+    inputBuffer.destroy();
+    outputBuffer.destroy();
+  }
+});
 
 function skipSoftwareDevice(device: Device, context: TestContext): void {
   // Like the P.1 projection tests, composed integer-fp64 shaders exceed SwiftShader's practical

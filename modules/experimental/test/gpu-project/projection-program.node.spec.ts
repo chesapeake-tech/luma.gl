@@ -6,6 +6,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {Buffer} from '@luma.gl/core';
 import {GPUCommandGraph} from '@luma.gl/gpgpu/gpu-core';
 import {NullDevice} from '@luma.gl/test-utils';
+import {WGSLShaderAssembler, type PlatformInfo} from '@luma.gl/shadertools';
 import {
   compileProjectionPlan,
   compileProjectionProgram,
@@ -152,6 +153,35 @@ describe('projection programs', () => {
     expect(
       first.isCompatible(compileProjectionProgram(nativeProgram, {inputFormat: 'uint32x4'}))
     ).toBe(false);
+  });
+
+  it('selects fp64 arithmetic by platform and carries the classic-path uniforms', () => {
+    const shader = compileProjectionProgram(nativeProgram).getShader();
+    expect(shader.defines).not.toHaveProperty('LUMA_FP64_INTEGER_ARITHMETIC');
+    expect(shader.modules.map(module => module.name)).toEqual(['fp64arithmetic']);
+    expect(shader.modules[0].uniformTypes).toEqual({ONE: 'f32', SPLIT: 'f32'});
+    expect(shader.modules[0].defaultUniforms).toEqual({ONE: 1, SPLIT: 4097});
+
+    const platformInfo: PlatformInfo = {
+      type: 'webgpu',
+      gpu: 'nvidia',
+      shaderLanguage: 'wgsl',
+      shaderLanguageVersion: 300,
+      features: new Set()
+    };
+    const assemble = (gpu: string) =>
+      new WGSLShaderAssembler().assembleWGSLShader({
+        platformInfo: {...platformInfo, gpu},
+        source: shader.source,
+        modules: shader.modules,
+        defines: shader.defines
+      }).source;
+    const integerMarker = 'fn fp64_accumulate_f32_integer';
+    const classicMarker = 'let splitValue = prevent_fp64_optimization';
+    expect(assemble('apple')).toContain(integerMarker);
+    expect(assemble('apple')).not.toContain(classicMarker);
+    expect(assemble('nvidia')).toContain(classicMarker);
+    expect(assemble('nvidia')).not.toContain(integerMarker);
   });
 
   it('snapshots parameters and supports independent shader namespaces and buffer offsets', () => {

@@ -11,7 +11,10 @@ import {
   GraphVectorView,
   type GraphImportedBuffer
 } from '@luma.gl/gpgpu/gpu-core';
-import {validateDisjointGeospatialViews} from '../../src/geospatial/geospatial-utils';
+import {
+  isWGSLIdentifierReachable,
+  validateDisjointGeospatialViews
+} from '../../src/geospatial/geospatial-utils';
 
 const BUFFER_BYTE_LENGTH = 1024;
 
@@ -176,3 +179,26 @@ function makeDynamicBuffer(buffer: Buffer): DynamicBuffer {
   Object.defineProperty(dynamicBuffer, '_buffer', {value: buffer});
   return dynamicBuffer;
 }
+
+describe('isWGSLIdentifierReachable', () => {
+  const source = /* wgsl */ `
+@group(0) @binding(100) var<uniform> fp64arithmetic: Fp64ArithmeticUniforms;
+fn split(a: f32) -> vec2f { return vec2f(a * fp64arithmetic.SPLIT, 0.0); }
+fn mul(a: f32) -> vec2f { return split(a); }
+fn add(a: f32) -> f32 { return a + 1.0; }
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let value = ENTRY_CALL;
+}`;
+
+  it('follows calls from the compute entry point', () => {
+    expect(
+      isWGSLIdentifierReachable(source.replace('ENTRY_CALL', 'mul(1.0).x'), 'fp64arithmetic.')
+    ).toBe(true);
+  });
+
+  it('ignores functions the entry point never calls', () => {
+    expect(
+      isWGSLIdentifierReachable(source.replace('ENTRY_CALL', 'add(1.0)'), 'fp64arithmetic.')
+    ).toBe(false);
+  });
+});
